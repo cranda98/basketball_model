@@ -347,6 +347,48 @@ print(f"Auto-dropped {len(low_corr_cols)} low-correlation features (|corr| < 0.0
 for c in low_corr_cols:
     print(f"  {c}  (|corr|={corr_series[c]:.4f})")
 
+# 11c. RECURSIVE FEATURE ELIMINATION (RFE) via GradientBoostingClassifier
+# Keep the top 15–20 features by importance score.
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.feature_selection import RFE
+
+RFE_N_FEATURES = 17  # target number of features to keep (within 15–20)
+
+meta_cols_set = {
+    'gameId', 'gameDateTimeEst', 'hometeamName', 'awayteamName',
+    'hometeamId', 'awayteamId', 'homeScore', 'awayScore', 'season_year',
+    'home_win', 'point_diff'
+}
+
+rfe_candidates = [c for c in train.columns if c not in meta_cols_set]
+
+X_train_rfe = train[rfe_candidates].values
+y_train_rfe = train['home_win'].values
+
+gbc = GradientBoostingClassifier(n_estimators=100, random_state=42)
+selector = RFE(estimator=gbc, n_features_to_select=RFE_N_FEATURES, step=1)
+selector.fit(X_train_rfe, y_train_rfe)
+
+rfe_mask = selector.support_
+kept_features   = [c for c, s in zip(rfe_candidates, rfe_mask) if s]
+dropped_features = [c for c, s in zip(rfe_candidates, rfe_mask) if not s]
+
+print(f"\nRFE: kept {len(kept_features)} features, dropped {len(dropped_features)} features")
+print("  Kept:")
+for c in kept_features:
+    print(f"    {c}")
+print("  Dropped by RFE:")
+for c in dropped_features:
+    print(f"    {c}")
+
+keep_cols = list(meta_cols_set & set(final.columns)) + kept_features
+# Preserve original column order
+keep_cols_ordered = [c for c in final.columns if c in set(keep_cols)]
+
+final = final[keep_cols_ordered]
+train = train[keep_cols_ordered]
+test  = test[keep_cols_ordered]
+
 # 12. SAVE
 final.to_csv('data/nba_processed_full.csv', index=False)
 train.to_csv('data/nba_train.csv', index=False)
@@ -355,10 +397,7 @@ test.to_csv('data/nba_test.csv', index=False)
 print("\nSaved: nba_processed_full.csv | nba_train.csv | nba_test.csv")
 
 # 13. FINAL FEATURE LIST
-feat_cols = [c for c in final.columns if c not in
-             ['gameId','gameDateTimeEst','hometeamName','awayteamName',
-              'hometeamId','awayteamId','homeScore','awayScore','season_year',
-              'home_win','point_diff']]
+feat_cols = [c for c in final.columns if c not in meta_cols_set]
 print(f"\nTotal features for modeling: {len(feat_cols)}")
 for c in feat_cols:
     print(f"  {c}")
