@@ -37,7 +37,7 @@ Three tables are used:
 
 ## Responsible AI Use
 
-GitHub Copilot was used to help draft and scaffold parts of this project. All 
+Claude was used to help draft and scaffold parts of this project. All 
 generated code has been reviewed, tested, and revised before being treated as 
 correct. AI assistance was used to accelerate development but not to replace my 
 own understanding or judgment of the resulting workflow.
