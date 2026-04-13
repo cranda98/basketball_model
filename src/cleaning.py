@@ -34,7 +34,7 @@ games['season_year'] = np.where(
 
 reg = games[
     (games['type_code'] == '2') &
-    (games['season_year'] >= 2000)
+    (games['season_year'] >= 2015)
 ].copy().sort_values('gameDateTimeEst').reset_index(drop=True)
 before = len(reg)
 reg = reg[
@@ -44,7 +44,7 @@ reg = reg[
 ].copy()
 print(f"Dropped {before - len(reg)} games with missing/invalid scores")
 
-print(f"\nRegular season games (2000+): {len(reg):,}")
+print(f"\nRegular season games (2015+): {len(reg):,}")
 print(f"  Date range:   {reg['gameDateTimeEst'].min().date()} → {reg['gameDateTimeEst'].max().date()}")
 print(f"  Home win rate: {(reg['homeScore'] > reg['awayScore']).mean():.3%}")
 
@@ -247,6 +247,64 @@ final['diff_win_streak'] = final['home_win_streak'] - final['away_win_streak']
 
 print(f"After diff features: {final.shape}")
 
+# 10b. ROLLING HOME COURT TREND (3-season rolling win rate at home / on road)
+print("Computing home court trend features...")
+
+# Compute per-team per-season home win rate
+home_seasonal = (
+    reg.groupby(['hometeamId', 'season_year'])['home_win']
+    .mean()
+    .reset_index()
+    .rename(columns={'hometeamId': 'teamId', 'home_win': 'home_win_rate_season'})
+    .sort_values(['teamId', 'season_year'])
+)
+
+# Compute per-team per-season away win rate
+reg['away_win'] = 1 - reg['home_win']
+away_seasonal = (
+    reg.groupby(['awayteamId', 'season_year'])['away_win']
+    .mean()
+    .reset_index()
+    .rename(columns={'awayteamId': 'teamId', 'away_win': 'away_win_rate_season'})
+    .sort_values(['teamId', 'season_year'])
+)
+
+# Rolling 3-season average (using only prior seasons via shift(1))
+home_seasonal['home_court_trend'] = (
+    home_seasonal.groupby('teamId')['home_win_rate_season']
+    .transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+)
+away_seasonal['away_court_trend'] = (
+    away_seasonal.groupby('teamId')['away_win_rate_season']
+    .transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+)
+
+# Attach season_year to final for merging
+final['season_year'] = np.where(
+    final['gameDateTimeEst'].dt.month >= 10,
+    final['gameDateTimeEst'].dt.year,
+    final['gameDateTimeEst'].dt.year - 1
+)
+
+final = final.merge(
+    home_seasonal[['teamId', 'season_year', 'home_court_trend']].rename(columns={'teamId': 'hometeamId'}),
+    on=['hometeamId', 'season_year'], how='left'
+)
+final = final.merge(
+    away_seasonal[['teamId', 'season_year', 'away_court_trend']].rename(columns={'teamId': 'awayteamId'}),
+    on=['awayteamId', 'season_year'], how='left'
+)
+
+# Fill NaN for teams in their first season (no prior data) with median
+median_hct = final['home_court_trend'].median()
+median_act = final['away_court_trend'].median()
+final['home_court_trend'] = final['home_court_trend'].fillna(median_hct)
+final['away_court_trend'] = final['away_court_trend'].fillna(median_act)
+
+final['diff_court_trend'] = final['home_court_trend'] - final['away_court_trend']
+
+print(f"After court trend features: {final.shape}")
+
 # 11. TRAIN / TEST SPLIT
 final['season_year'] = np.where(
     final['gameDateTimeEst'].dt.month >= 10,
@@ -261,6 +319,33 @@ print(f"\nTrain: {len(train):,} ({train['gameDateTimeEst'].min().date()} → {tr
 print(f"Test:  {len(test):,}  ({test['gameDateTimeEst'].min().date()} → {test['gameDateTimeEst'].max().date()})")
 print(f"Train home win rate: {train['home_win'].mean():.3%}")
 print(f"Test  home win rate: {test['home_win'].mean():.3%}")
+
+# 11b. FEATURE SELECTION
+# Explicitly drop highly correlated redundant features
+explicit_drop = [
+    'home_roll_efg_proxy', 'away_roll_efg_proxy', 'diff_efg_proxy',
+    'home_roll_win',       'away_roll_win',        'diff_win',
+]
+explicit_drop = [c for c in explicit_drop if c in final.columns]
+final.drop(columns=explicit_drop, inplace=True)
+train.drop(columns=explicit_drop, inplace=True)
+test.drop(columns=explicit_drop, inplace=True)
+print(f"\nExplicitly dropped {len(explicit_drop)} features: {explicit_drop}")
+
+# Auto-drop features with |correlation| < 0.05 against home_win (computed on train)
+meta_cols = {'gameId','gameDateTimeEst','hometeamName','awayteamName',
+             'hometeamId','awayteamId','homeScore','awayScore','season_year',
+             'home_win','point_diff'}
+feature_candidates = [c for c in train.columns if c not in meta_cols]
+corr_series = train[feature_candidates].corrwith(train['home_win']).abs()
+low_corr_cols = corr_series[corr_series < 0.05].index.tolist()
+if low_corr_cols:
+    final.drop(columns=low_corr_cols, inplace=True)
+    train.drop(columns=low_corr_cols, inplace=True)
+    test.drop(columns=low_corr_cols, inplace=True)
+print(f"Auto-dropped {len(low_corr_cols)} low-correlation features (|corr| < 0.05):")
+for c in low_corr_cols:
+    print(f"  {c}  (|corr|={corr_series[c]:.4f})")
 
 # 12. SAVE
 final.to_csv('data/nba_processed_full.csv', index=False)
