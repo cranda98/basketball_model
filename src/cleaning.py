@@ -5,6 +5,8 @@ NBA Game Outcome Prediction - Data Preprocessing Pipeline
 
 import pandas as pd
 import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.feature_selection import RFE
 
 # 1. LOAD RAW DATA
 games = pd.read_csv('data/cse482_project_db_Games.csv')
@@ -349,10 +351,8 @@ for c in low_corr_cols:
 
 # 11c. RECURSIVE FEATURE ELIMINATION (RFE) via GradientBoostingClassifier
 # Keep the top 15–20 features by importance score.
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.feature_selection import RFE
-
-RFE_N_FEATURES = 17  # target number of features to keep (within 15–20)
+RFE_N_FEATURES   = 17   # target number of features to keep (within 15–20)
+RFE_N_ESTIMATORS = 100
 
 meta_cols_set = {
     'gameId', 'gameDateTimeEst', 'hometeamName', 'awayteamName',
@@ -365,7 +365,7 @@ rfe_candidates = [c for c in train.columns if c not in meta_cols_set]
 X_train_rfe = train[rfe_candidates].values
 y_train_rfe = train['home_win'].values
 
-gbc = GradientBoostingClassifier(n_estimators=100, random_state=42)
+gbc = GradientBoostingClassifier(n_estimators=RFE_N_ESTIMATORS, random_state=42)
 selector = RFE(estimator=gbc, n_features_to_select=RFE_N_FEATURES, step=1)
 selector.fit(X_train_rfe, y_train_rfe)
 
@@ -381,7 +381,7 @@ print("  Dropped by RFE:")
 for c in dropped_features:
     print(f"    {c}")
 
-keep_cols = list(meta_cols_set & set(final.columns)) + kept_features
+keep_cols = [c for c in meta_cols_set if c in final.columns] + kept_features
 # Preserve original column order
 keep_cols_ordered = [c for c in final.columns if c in set(keep_cols)]
 
