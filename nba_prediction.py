@@ -44,12 +44,12 @@ warnings.filterwarnings("ignore")
 # Constants
 # ---------------------------------------------------------------------------
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "data")
 TRAIN_CSV = os.path.join(DATA_DIR, "nba_train.csv")
 TEST_CSV = os.path.join(DATA_DIR, "nba_test.csv")
 FULL_CSV = os.path.join(DATA_DIR, "nba_processed_full.csv")
 
-PLOTS_DIR = os.path.join(DATA_DIR, "plots")
+PLOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
 # Gradient Boosting hyper-parameters (shared by both tasks)
