@@ -112,8 +112,18 @@ BOX_COLS = [
     'turnovers'
 ]
 
+ADV_COLS = ['defRating', 'eOffRating', 'efgPct', 'netRating', 'pace', 'tsPct']
+
 reg_ids   = set(reg['gameId'])
 reg_stats = stats[stats['gameId'].isin(reg_ids)][['gameId','teamId'] + BOX_COLS].copy()
+
+# 5b. JOIN ADVANCED STATS
+print("Joining advanced stats...")
+adv_reg = adv[adv['gameId'].isin(reg_ids)][['gameId', 'teamId'] + ADV_COLS].copy()
+reg_stats = reg_stats.merge(adv_reg, on=['gameId', 'teamId'], how='left')
+for col in ADV_COLS:
+    reg_stats[col] = reg_stats[col].fillna(reg_stats[col].median())
+print(f"  Advanced stats joined: {len(adv_reg):,} rows matched")
 
 # Include season_year in lookup so win streak can use it
 game_lookup = reg.set_index('gameId')[
@@ -152,7 +162,7 @@ ENGINEERED_COLS = ['ast_to_ratio', 'efg_proxy', 'net_margin']
 # Build team_game must include season_year for win streak reset
 team_game = reg_stats[
     ['gameId','gameDateTimeEst','season_year','teamId','role','win','team_score','opp_score']
-    + BOX_COLS + ENGINEERED_COLS
+    + BOX_COLS + ENGINEERED_COLS + ADV_COLS
 ].copy().sort_values(['teamId','gameDateTimeEst']).reset_index(drop=True)
 
 print(f"\nTeam-game rows: {len(team_game):,} (expected {len(reg)*2:,})")
@@ -198,29 +208,91 @@ print(f"  Spurs all-time max streak:   {sp['win_streak'].max()}")
 
 print(f"  Overall max streak: {team_game['win_streak'].max()} (NBA record since 2000 is 27)")
 
-# 8. ROLLING AVERAGES (last N games, no leakage)
+# 7b. ELO RATINGS (no leakage — use Elo going INTO each game)
+print("Computing Elo ratings...")
+ELO_K = 20
+elo_dict = {}  # teamId → current Elo
+elo_records = []
+
+for _, game in reg.iterrows():
+    home_id = game['hometeamId']
+    away_id = game['awayteamId']
+
+    home_elo = elo_dict.get(home_id, 1500)
+    away_elo = elo_dict.get(away_id, 1500)
+
+    elo_records.append({
+        'gameId': game['gameId'],
+        'home_elo': home_elo,
+        'away_elo': away_elo,
+    })
+
+    # Expected scores
+    exp_home = 1 / (1 + 10 ** ((away_elo - home_elo) / 400))
+    exp_away = 1 - exp_home
+
+    # Actual outcome
+    actual_home = 1 if game['homeScore'] > game['awayScore'] else 0
+    actual_away = 1 - actual_home
+
+    # Update Elo
+    elo_dict[home_id] = home_elo + ELO_K * (actual_home - exp_home)
+    elo_dict[away_id] = away_elo + ELO_K * (actual_away - exp_away)
+
+elo_df = pd.DataFrame(elo_records)
+elo_df['diff_elo'] = elo_df['home_elo'] - elo_df['away_elo']
+print(f"  Elo range: {elo_df['home_elo'].min():.1f} – {elo_df['home_elo'].max():.1f}")
+
+# 7c. SEASON STAGE (games_into_season counts games played BEFORE this one)
+print("Computing season stage features...")
+
+team_game_ss = team_game.sort_values(['teamId', 'season_year', 'gameDateTimeEst']).copy()
+team_game_ss['games_into_season'] = team_game_ss.groupby(['teamId', 'season_year']).cumcount()
+
+def _season_stage_bucket(n):
+    if n < 25:
+        return 0  # early
+    elif n < 57:
+        return 1  # mid
+    else:
+        return 2  # late
+
+team_game_ss['season_stage'] = team_game_ss['games_into_season'].apply(_season_stage_bucket)
+
+# Pivot to home/away for merging into final later
+season_stage_home = team_game_ss[team_game_ss['role'] == 'home'][
+    ['gameId', 'games_into_season', 'season_stage']
+].rename(columns={'games_into_season': 'home_games_into_season', 'season_stage': 'home_season_stage'})
+season_stage_away = team_game_ss[team_game_ss['role'] == 'away'][
+    ['gameId', 'games_into_season', 'season_stage']
+].rename(columns={'games_into_season': 'away_games_into_season', 'season_stage': 'away_season_stage'})
+
+print(f"  Season stage distribution: early={(_season_stage_bucket(0) == 0)}, mid, late")
+
+# 8. ROLLING AVERAGES (multi-window sweep, no leakage)
 # shift(1) ensures we only use information from BEFORE the current game.
 # min_periods=3 allows early-season rows with some history.
 # NOTE: rolling window intentionally crosses season boundaries —
 # a team's last 10 games going into game 1 of a new season includes
 # games from the previous season, which is valid recent form.
-N = 10
-ROLL_COLS = ['win','team_score','opp_score','net_margin'] + BOX_COLS + ENGINEERED_COLS
+ROLL_WINDOWS = [5, 10, 15]
+ROLL_COLS = ['win','team_score','opp_score','net_margin'] + BOX_COLS + ENGINEERED_COLS + ADV_COLS
 
-print(f"Computing {N}-game rolling averages...")
+print(f"Computing rolling averages for windows {ROLL_WINDOWS}...")
 roll_feats = {}
-for col in ROLL_COLS:
-    roll_feats[f'roll_{col}'] = (
-        team_game.groupby('teamId')[col]
-        .transform(lambda x: x.shift(1).rolling(N, min_periods=3).mean())
-    )
+for n in ROLL_WINDOWS:
+    for col in ROLL_COLS:
+        roll_feats[f'roll{n}_{col}'] = (
+            team_game.groupby('teamId')[col]
+            .transform(lambda x: x.shift(1).rolling(n, min_periods=3).mean())
+        )
 
 rolling_df = team_game[['gameId','teamId','role','win_streak']].copy()
 for k, v in roll_feats.items():
     rolling_df[k] = v
 
 before = len(rolling_df)
-rolling_df = rolling_df.dropna(subset=['roll_win'])
+rolling_df = rolling_df.dropna(subset=['roll5_win'])
 print(f"  Dropped {before - len(rolling_df):,} rows (insufficient history)")
 
 # 9. PIVOT TO ONE ROW PER GAME
@@ -246,10 +318,12 @@ assert final.isnull().sum().sum() == 0, "Unexpected nulls in final dataset!"
 print(f"\nFinal shape: {final.shape} | Nulls: {final.isnull().sum().sum()} ✓")
 print(f"Home win rate: {final['home_win'].mean():.3%}")
 
-# 10. DIFFERENCE FEATURES (home − away)
-diff_base = [c.replace('home_roll_','') for c in final.columns if c.startswith('home_roll_')]
-for col in diff_base:
-    final[f'diff_{col}'] = final[f'home_roll_{col}'] - final[f'away_roll_{col}']
+# 10. DIFFERENCE FEATURES (home − away) for each rolling window
+for n in ROLL_WINDOWS:
+    prefix = f'home_roll{n}_'
+    base_cols = [c.replace(prefix, '') for c in final.columns if c.startswith(prefix)]
+    for col in base_cols:
+        final[f'diff_roll{n}_{col}'] = final[f'home_roll{n}_{col}'] - final[f'away_roll{n}_{col}']
 
 final['diff_win_streak'] = final['home_win_streak'] - final['away_win_streak']
 
@@ -349,7 +423,7 @@ print("Computing opponent strength features...")
 team_game_sorted = team_game.sort_values(['teamId', 'gameDateTimeEst']).copy()
 team_game_sorted['team_roll_win_rate'] = (
     team_game_sorted.groupby('teamId')['win']
-    .transform(lambda x: x.shift(1).rolling(N, min_periods=3).mean())
+    .transform(lambda x: x.shift(1).rolling(10, min_periods=3).mean())
 )
 
 # Derive opponent team ID using game_lookup (which has hometeamId/awayteamId)
@@ -373,7 +447,7 @@ team_game_sorted = team_game_sorted.merge(opp_wr_lookup, on=['gameId', 'oppTeamI
 team_game_sorted = team_game_sorted.sort_values(['teamId', 'gameDateTimeEst']).reset_index(drop=True)
 team_game_sorted['opp_strength'] = (
     team_game_sorted.groupby('teamId')['opp_roll_win_rate']
-    .transform(lambda x: x.shift(1).rolling(N, min_periods=3).mean())
+    .transform(lambda x: x.shift(1).rolling(10, min_periods=3).mean())
 )
 
 # Pivot to home/away
@@ -444,6 +518,26 @@ print(f"  home_venue_win_streak max: {final['home_venue_win_streak'].max()}")
 print(f"  away_venue_win_streak max: {final['away_venue_win_streak'].max()}")
 
 print(f"After new engineered features: {final.shape}")
+
+# 10f. MERGE ELO RATINGS
+print("Merging Elo ratings into final...")
+final = final.merge(elo_df, on='gameId', how='left')
+final['home_elo'] = final['home_elo'].fillna(1500)
+final['away_elo'] = final['away_elo'].fillna(1500)
+final['diff_elo'] = final['diff_elo'].fillna(0)
+print(f"  Elo features added: home_elo, away_elo, diff_elo")
+
+# 10g. MERGE SEASON STAGE
+print("Merging season stage features into final...")
+final = final.merge(season_stage_home, on='gameId', how='left')
+final = final.merge(season_stage_away, on='gameId', how='left')
+final['home_games_into_season'] = final['home_games_into_season'].fillna(0).astype(int)
+final['away_games_into_season'] = final['away_games_into_season'].fillna(0).astype(int)
+final['home_season_stage'] = final['home_season_stage'].fillna(0).astype(int)
+final['away_season_stage'] = final['away_season_stage'].fillna(0).astype(int)
+print(f"  Season stage features added")
+
+print(f"After all engineered features: {final.shape}")
 
 # 11. TRAIN / TEST SPLIT
 final['season_year'] = np.where(
