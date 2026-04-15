@@ -7,8 +7,8 @@ import os
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.feature_selection import RFE
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.preprocessing import StandardScaler
 
 # Resolve paths relative to this script so it runs from any working directory
 _SRC_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -313,6 +313,138 @@ final['diff_court_trend'] = final['home_court_trend'] - final['away_court_trend'
 
 print(f"After court trend features: {final.shape}")
 
+# 10c. HEAD-TO-HEAD WIN RATE (rolling 3 seasons, no leakage)
+print("Computing head-to-head win rate features...")
+
+# Build a lookup of (hometeamId, awayteamId, season_year) → home win rate
+h2h_seasonal = (
+    reg.groupby(['hometeamId', 'awayteamId', 'season_year'])['home_win']
+    .mean()
+    .reset_index()
+    .rename(columns={'home_win': 'h2h_win_rate_season'})
+    .sort_values(['hometeamId', 'awayteamId', 'season_year'])
+)
+
+# Rolling 3-season average using only prior seasons (shift(1))
+h2h_seasonal['h2h_home_win_rate'] = (
+    h2h_seasonal.groupby(['hometeamId', 'awayteamId'])['h2h_win_rate_season']
+    .transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+)
+
+final = final.merge(
+    h2h_seasonal[['hometeamId', 'awayteamId', 'season_year', 'h2h_home_win_rate']],
+    on=['hometeamId', 'awayteamId', 'season_year'], how='left'
+)
+# Fill NaN (first meeting or first season) with overall home win rate
+median_h2h = final['h2h_home_win_rate'].median()
+final['h2h_home_win_rate'] = final['h2h_home_win_rate'].fillna(median_h2h)
+
+print(f"  h2h_home_win_rate range: {final['h2h_home_win_rate'].min():.3f} – {final['h2h_home_win_rate'].max():.3f}")
+
+# 10d. OPPONENT STRENGTH (rolling average of opponents' win rates, last 10 games)
+print("Computing opponent strength features...")
+
+# For each team-game, get the opponent's rolling win rate
+# First compute each team's rolling win rate (already in team_game as 'win')
+team_game_sorted = team_game.sort_values(['teamId', 'gameDateTimeEst']).copy()
+team_game_sorted['team_roll_win_rate'] = (
+    team_game_sorted.groupby('teamId')['win']
+    .transform(lambda x: x.shift(1).rolling(N, min_periods=3).mean())
+)
+
+# Derive opponent team ID using game_lookup (which has hometeamId/awayteamId)
+opp_lookup = game_lookup[['hometeamId', 'awayteamId']].reset_index()
+# For each team_game row, the opponent is the other team in the same game
+team_game_sorted = team_game_sorted.merge(opp_lookup, on='gameId', how='left')
+team_game_sorted['oppTeamId'] = np.where(
+    team_game_sorted['role'] == 'home',
+    team_game_sorted['awayteamId'],
+    team_game_sorted['hometeamId']
+)
+team_game_sorted.drop(columns=['hometeamId', 'awayteamId'], inplace=True)
+
+# For each game, look up the opponent's rolling win rate
+opp_wr_lookup = team_game_sorted[['gameId', 'teamId', 'team_roll_win_rate']].copy()
+opp_wr_lookup = opp_wr_lookup.rename(columns={'teamId': 'oppTeamId', 'team_roll_win_rate': 'opp_roll_win_rate'})
+
+team_game_sorted = team_game_sorted.merge(opp_wr_lookup, on=['gameId', 'oppTeamId'], how='left')
+
+# Now compute rolling average of opponents' win rates (last 10 games) for opponent strength
+team_game_sorted = team_game_sorted.sort_values(['teamId', 'gameDateTimeEst']).reset_index(drop=True)
+team_game_sorted['opp_strength'] = (
+    team_game_sorted.groupby('teamId')['opp_roll_win_rate']
+    .transform(lambda x: x.shift(1).rolling(N, min_periods=3).mean())
+)
+
+# Pivot to home/away
+home_opp_str = team_game_sorted[team_game_sorted['role'] == 'home'][['gameId', 'opp_strength']].rename(
+    columns={'opp_strength': 'home_opp_strength'}
+)
+away_opp_str = team_game_sorted[team_game_sorted['role'] == 'away'][['gameId', 'opp_strength']].rename(
+    columns={'opp_strength': 'away_opp_strength'}
+)
+
+final = final.merge(home_opp_str, on='gameId', how='left')
+final = final.merge(away_opp_str, on='gameId', how='left')
+
+# Fill NaN with median
+final['home_opp_strength'] = final['home_opp_strength'].fillna(final['home_opp_strength'].median())
+final['away_opp_strength'] = final['away_opp_strength'].fillna(final['away_opp_strength'].median())
+final['diff_opp_strength'] = final['home_opp_strength'] - final['away_opp_strength']
+
+print(f"  home_opp_strength range: {final['home_opp_strength'].min():.3f} – {final['home_opp_strength'].max():.3f}")
+
+# 10e. HOME-SPECIFIC WIN STREAK (consecutive home wins / road wins)
+print("Computing home-specific win streak features...")
+
+def compute_venue_streak(sub):
+    """
+    Count consecutive wins at the same venue going into each game.
+    sub must be sorted by gameDateTimeEst ascending and all same role (home or away).
+    Resets at season boundaries and on any loss.
+    """
+    wins = sub['win'].values
+    seasons = sub['season_year'].values
+    streaks = np.zeros(len(wins), dtype=int)
+    current = 0
+    for i in range(len(wins)):
+        if i > 0 and seasons[i] != seasons[i - 1]:
+            current = 0
+        streaks[i] = current
+        current = current + 1 if wins[i] == 1 else 0
+    return pd.Series(streaks, index=sub.index)
+
+# Split team_game by role and compute venue-specific streaks
+home_games = team_game[team_game['role'] == 'home'].sort_values(['teamId', 'gameDateTimeEst']).copy()
+away_games = team_game[team_game['role'] == 'away'].sort_values(['teamId', 'gameDateTimeEst']).copy()
+
+home_venue_streaks = []
+for tid, grp in home_games.groupby('teamId'):
+    home_venue_streaks.append(compute_venue_streak(grp))
+home_games['home_venue_win_streak'] = pd.concat(home_venue_streaks)
+
+away_venue_streaks = []
+for tid, grp in away_games.groupby('teamId'):
+    away_venue_streaks.append(compute_venue_streak(grp))
+away_games['away_venue_win_streak'] = pd.concat(away_venue_streaks)
+
+# Merge into final
+final = final.merge(
+    home_games[['gameId', 'home_venue_win_streak']], on='gameId', how='left'
+)
+final = final.merge(
+    away_games[['gameId', 'away_venue_win_streak']], on='gameId', how='left'
+)
+
+final['home_venue_win_streak'] = final['home_venue_win_streak'].fillna(0).astype(int)
+final['away_venue_win_streak'] = final['away_venue_win_streak'].fillna(0).astype(int)
+final['diff_venue_win_streak'] = final['home_venue_win_streak'] - final['away_venue_win_streak']
+
+print(f"  home_venue_win_streak max: {final['home_venue_win_streak'].max()}")
+print(f"  away_venue_win_streak max: {final['away_venue_win_streak'].max()}")
+
+print(f"After new engineered features: {final.shape}")
+
 # 11. TRAIN / TEST SPLIT
 final['season_year'] = np.where(
     final['gameDateTimeEst'].dt.month >= 10,
@@ -328,64 +460,56 @@ print(f"Test:  {len(test):,}  ({test['gameDateTimeEst'].min().date()} → {test[
 print(f"Train home win rate: {train['home_win'].mean():.3%}")
 print(f"Test  home win rate: {test['home_win'].mean():.3%}")
 
-# 11b. FEATURE SELECTION
-# Explicitly drop highly correlated redundant features
-explicit_drop = [
-    'home_roll_efg_proxy', 'away_roll_efg_proxy', 'diff_efg_proxy',
-    'home_roll_win',       'away_roll_win',        'diff_win',
-]
-explicit_drop = [c for c in explicit_drop if c in final.columns]
-final.drop(columns=explicit_drop, inplace=True)
-train.drop(columns=explicit_drop, inplace=True)
-test.drop(columns=explicit_drop, inplace=True)
-print(f"\nExplicitly dropped {len(explicit_drop)} features: {explicit_drop}")
-
-# Auto-drop features with |correlation| < 0.05 against home_win (computed on train)
-meta_cols = {'gameId','gameDateTimeEst','hometeamName','awayteamName',
-             'hometeamId','awayteamId','homeScore','awayScore','season_year',
-             'home_win','point_diff'}
-feature_candidates = [c for c in train.columns if c not in meta_cols]
-corr_series = train[feature_candidates].corrwith(train['home_win']).abs()
-low_corr_cols = corr_series[corr_series < 0.05].index.tolist()
-if low_corr_cols:
-    final.drop(columns=low_corr_cols, inplace=True)
-    train.drop(columns=low_corr_cols, inplace=True)
-    test.drop(columns=low_corr_cols, inplace=True)
-print(f"Auto-dropped {len(low_corr_cols)} low-correlation features (|corr| < 0.05):")
-for c in low_corr_cols:
-    print(f"  {c}  (|corr|={corr_series[c]:.4f})")
-
-# 11c. RECURSIVE FEATURE ELIMINATION (RFE) via GradientBoostingClassifier
-# Keep the top 15–20 features by importance score.
-RFE_N_FEATURES   = 17   # target number of features to keep (within 15–20)
-RFE_N_ESTIMATORS = 100
-
+# 11b. FEATURE SELECTION VIA LDA (Linear Discriminant Analysis)
 meta_cols_set = {
     'gameId', 'gameDateTimeEst', 'hometeamName', 'awayteamName',
     'hometeamId', 'awayteamId', 'homeScore', 'awayScore', 'season_year',
     'home_win', 'point_diff'
 }
 
-rfe_candidates = [c for c in train.columns if c not in meta_cols_set]
+feature_candidates = [c for c in train.columns if c not in meta_cols_set]
 
-X_train_rfe = train[rfe_candidates].values
-y_train_rfe = train['home_win'].values
+X_train_lda = train[feature_candidates].values
+y_train_lda = train['home_win'].values
 
-gbc = GradientBoostingClassifier(n_estimators=RFE_N_ESTIMATORS, random_state=42)
-selector = RFE(estimator=gbc, n_features_to_select=RFE_N_FEATURES, step=1)
-selector.fit(X_train_rfe, y_train_rfe)
+# Scale features for LDA
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_lda)
 
-rfe_mask = selector.support_
-kept_features   = [c for c, s in zip(rfe_candidates, rfe_mask) if s]
-dropped_features = [c for c, s in zip(rfe_candidates, rfe_mask) if not s]
+lda = LinearDiscriminantAnalysis()
+lda.fit(X_train_scaled, y_train_lda)
 
-print(f"\nRFE: kept {len(kept_features)} features, dropped {len(dropped_features)} features")
-print("  Kept:")
-for c in kept_features:
-    print(f"    {c}")
-print("  Dropped by RFE:")
-for c in dropped_features:
-    print(f"    {c}")
+# Rank features by absolute LDA coefficient weights, normalized to percentages
+abs_weights = np.abs(lda.coef_[0])
+weight_pct = abs_weights / abs_weights.sum() * 100
+
+lda_df = pd.DataFrame({
+    'feature': feature_candidates,
+    'weight_pct': weight_pct,
+}).sort_values('weight_pct', ascending=False)
+
+# Threshold sweep: show how many features each threshold keeps
+print("\n--- LDA Threshold Sweep ---")
+for threshold in [0.005, 0.01, 0.015, 0.02]:
+    threshold_pct = threshold * 100
+    n_kept = (lda_df['weight_pct'] >= threshold_pct).sum()
+    print(f"  Threshold {threshold} ({threshold_pct:.1f}%): keeps {n_kept} / {len(feature_candidates)} features")
+
+# Apply 1% threshold for final selection
+LDA_THRESHOLD_PCT = 1.0
+kept_mask = lda_df['weight_pct'] >= LDA_THRESHOLD_PCT
+kept_lda = lda_df[kept_mask]
+dropped_lda = lda_df[~kept_mask]
+
+print(f"\nLDA feature selection (threshold={LDA_THRESHOLD_PCT}%): kept {len(kept_lda)} features, dropped {len(dropped_lda)} features")
+print("  Kept features and weights:")
+for _, row in kept_lda.iterrows():
+    print(f"    {row['feature']:40s} {row['weight_pct']:.2f}%")
+print("  Dropped features (< 1% weight):")
+for _, row in dropped_lda.iterrows():
+    print(f"    {row['feature']:40s} {row['weight_pct']:.2f}%")
+
+kept_features = kept_lda['feature'].tolist()
 
 keep_cols = [c for c in meta_cols_set if c in final.columns] + kept_features
 # Preserve original column order

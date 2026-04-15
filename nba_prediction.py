@@ -6,7 +6,7 @@ Tasks:
   2. Regression     – predict the point differential (point_diff)
 
 Models:
-  Classification : Logistic Regression, Gradient Boosting
+  Classification : Logistic Regression, Gradient Boosting, PCA + Logistic Regression
   Regression     : Ridge Regression, Gradient Boosting
 
 Feature constraints:
@@ -26,8 +26,8 @@ import pandas as pd
 import seaborn as sns
 
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
-from sklearn.feature_selection import RFE
 from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.decomposition import PCA
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -73,9 +73,6 @@ REG_TARGET = "point_diff"
 
 CLF_EXCLUDE = {"homeScore", "awayScore", "point_diff"}
 REG_EXCLUDE = {"homeScore", "awayScore", "home_win"}
-
-# Number of top features to select with RFE
-RFE_N_FEATURES = 20
 
 
 # ---------------------------------------------------------------------------
@@ -171,24 +168,6 @@ def plot_ridge_coefficients(coef, feature_names, title, filename, top_n=20):
     plot_logistic_coefficients(coef, feature_names, title, filename, top_n)
 
 
-def plot_rfe_ranking(ranking, feature_names, selected_mask, title, filename, top_n=20):
-    """Bar chart showing RFE-selected features ranked by support."""
-    df = pd.DataFrame({"feature": feature_names, "ranking": ranking, "selected": selected_mask})
-    df_sel = df[df["selected"]].sort_values("ranking")
-    df_show = df_sel.head(top_n)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sns.barplot(data=df_show, x="ranking", y="feature", ax=ax, palette="coolwarm")
-    ax.set_title(title)
-    ax.set_xlabel("RFE Ranking (lower = more important)")
-    ax.set_ylabel("Feature")
-    plt.tight_layout()
-    path = os.path.join(PLOTS_DIR, filename)
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"  → saved: {path}")
-
-
 # ---------------------------------------------------------------------------
 # Classification pipeline
 # ---------------------------------------------------------------------------
@@ -206,7 +185,7 @@ def run_classification(train_df, test_df):
     print(f"  train    : {X_train.shape[0]} games")
     print(f"  test     : {X_test.shape[0]} games")
 
-    # Scale for Logistic Regression
+    # Scale for Logistic Regression and PCA
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
@@ -216,7 +195,7 @@ def run_classification(train_df, test_df):
     # ------------------------------------------------------------------
     # 1. Logistic Regression
     # ------------------------------------------------------------------
-    print("\n[1/4] Logistic Regression …")
+    print("\n[1/3] Logistic Regression …")
     lr = LogisticRegression(**LR_PARAMS)
     lr.fit(X_train_scaled, y_train)
     y_pred_lr = lr.predict(X_test_scaled)
@@ -239,7 +218,7 @@ def run_classification(train_df, test_df):
     # ------------------------------------------------------------------
     # 2. Gradient Boosting Classifier
     # ------------------------------------------------------------------
-    print("[2/4] Gradient Boosting Classifier …")
+    print("[2/3] Gradient Boosting Classifier …")
     gbc = GradientBoostingClassifier(**GB_PARAMS)
     gbc.fit(X_train, y_train)
     y_pred_gbc = gbc.predict(X_test)
@@ -260,42 +239,44 @@ def run_classification(train_df, test_df):
     )
 
     # ------------------------------------------------------------------
-    # 3. RFE with Logistic Regression
+    # 3. PCA + Logistic Regression (compare PCA vs LDA selected features)
     # ------------------------------------------------------------------
-    print(f"[3/4] RFE (Logistic Regression, selecting {RFE_N_FEATURES} features) …")
-    rfe_lr = RFE(
-        LogisticRegression(**LR_PARAMS),
-        n_features_to_select=RFE_N_FEATURES,
-        step=5,
-    )
-    rfe_lr.fit(X_train_scaled, y_train)
-    selected_features_lr = np.array(feature_names)[rfe_lr.support_]
-    print(f"  Selected features: {list(selected_features_lr)}")
+    print("[3/3] PCA + Logistic Regression …")
+    # Keep enough components to explain 95% of variance
+    pca = PCA(n_components=0.95, random_state=42)
+    X_train_pca = pca.fit_transform(X_train_scaled)
+    X_test_pca = pca.transform(X_test_scaled)
 
-    plot_rfe_ranking(
-        rfe_lr.ranking_, feature_names, rfe_lr.support_,
-        f"RFE (Logistic Regression) – Top {RFE_N_FEATURES} Features (Classification)",
-        "clf_rfe_logistic.png",
-    )
+    print(f"  PCA components: {pca.n_components_} (explaining {pca.explained_variance_ratio_.sum():.2%} variance)")
 
-    # ------------------------------------------------------------------
-    # 4. RFE with Gradient Boosting
-    # ------------------------------------------------------------------
-    print(f"[4/4] RFE (Gradient Boosting, selecting {RFE_N_FEATURES} features) …")
-    rfe_gb = RFE(
-        GradientBoostingClassifier(**GB_PARAMS),
-        n_features_to_select=RFE_N_FEATURES,
-        step=5,
-    )
-    rfe_gb.fit(X_train, y_train)
-    selected_features_gb = np.array(feature_names)[rfe_gb.support_]
-    print(f"  Selected features: {list(selected_features_gb)}")
+    lr_pca = LogisticRegression(**LR_PARAMS)
+    lr_pca.fit(X_train_pca, y_train)
+    y_pred_pca = lr_pca.predict(X_test_pca)
+    y_prob_pca = lr_pca.predict_proba(X_test_pca)[:, 1]
 
-    plot_rfe_ranking(
-        rfe_gb.ranking_, feature_names, rfe_gb.support_,
-        f"RFE (Gradient Boosting) – Top {RFE_N_FEATURES} Features (Classification)",
-        "clf_rfe_gb.png",
-    )
+    acc_pca = accuracy_score(y_test, y_pred_pca)
+    auc_pca = roc_auc_score(y_test, y_prob_pca)
+    results["PCA + Logistic Regression"] = {"Accuracy": acc_pca, "ROC-AUC": auc_pca}
+
+    print(f"  Accuracy : {acc_pca:.4f}")
+    print(f"  ROC-AUC  : {auc_pca:.4f}")
+    print(classification_report(y_test, y_pred_pca, target_names=["Away Win", "Home Win"]))
+
+    # Plot PCA explained variance
+    fig, ax = plt.subplots(figsize=(10, 6))
+    cumulative_var = np.cumsum(pca.explained_variance_ratio_)
+    ax.bar(range(1, len(pca.explained_variance_ratio_) + 1), pca.explained_variance_ratio_,
+           alpha=0.6, label="Individual")
+    ax.plot(range(1, len(cumulative_var) + 1), cumulative_var, 'ro-', label="Cumulative")
+    ax.set_title("PCA – Explained Variance Ratio (Classification)")
+    ax.set_xlabel("Principal Component")
+    ax.set_ylabel("Explained Variance Ratio")
+    ax.legend()
+    plt.tight_layout()
+    path = os.path.join(PLOTS_DIR, "clf_pca_variance.png")
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"  → saved: {path}")
 
     # ------------------------------------------------------------------
     # Summary
@@ -334,7 +315,7 @@ def run_regression(train_df, test_df):
     # ------------------------------------------------------------------
     # 1. Ridge Regression
     # ------------------------------------------------------------------
-    print("\n[1/4] Ridge Regression …")
+    print("\n[1/2] Ridge Regression …")
     ridge = Ridge(**RIDGE_PARAMS)
     ridge.fit(X_train_scaled, y_train)
     y_pred_ridge = ridge.predict(X_test_scaled)
@@ -357,7 +338,7 @@ def run_regression(train_df, test_df):
     # ------------------------------------------------------------------
     # 2. Gradient Boosting Regressor
     # ------------------------------------------------------------------
-    print("[2/4] Gradient Boosting Regressor …")
+    print("[2/2] Gradient Boosting Regressor …")
     gbr = GradientBoostingRegressor(**GB_PARAMS)
     gbr.fit(X_train, y_train)
     y_pred_gbr = gbr.predict(X_test)
@@ -375,44 +356,6 @@ def run_regression(train_df, test_df):
         gbr.feature_importances_, feature_names,
         "Gradient Boosting – Feature Importances (Regression)",
         "reg_gb_feature_importance.png",
-    )
-
-    # ------------------------------------------------------------------
-    # 3. RFE with Ridge Regression
-    # ------------------------------------------------------------------
-    print(f"[3/4] RFE (Ridge, selecting {RFE_N_FEATURES} features) …")
-    rfe_ridge = RFE(
-        Ridge(**RIDGE_PARAMS),
-        n_features_to_select=RFE_N_FEATURES,
-        step=5,
-    )
-    rfe_ridge.fit(X_train_scaled, y_train)
-    selected_features_ridge = np.array(feature_names)[rfe_ridge.support_]
-    print(f"  Selected features: {list(selected_features_ridge)}")
-
-    plot_rfe_ranking(
-        rfe_ridge.ranking_, feature_names, rfe_ridge.support_,
-        f"RFE (Ridge) – Top {RFE_N_FEATURES} Features (Regression)",
-        "reg_rfe_ridge.png",
-    )
-
-    # ------------------------------------------------------------------
-    # 4. RFE with Gradient Boosting
-    # ------------------------------------------------------------------
-    print(f"[4/4] RFE (Gradient Boosting, selecting {RFE_N_FEATURES} features) …")
-    rfe_gb = RFE(
-        GradientBoostingRegressor(**GB_PARAMS),
-        n_features_to_select=RFE_N_FEATURES,
-        step=5,
-    )
-    rfe_gb.fit(X_train, y_train)
-    selected_features_gb = np.array(feature_names)[rfe_gb.support_]
-    print(f"  Selected features: {list(selected_features_gb)}")
-
-    plot_rfe_ranking(
-        rfe_gb.ranking_, feature_names, rfe_gb.support_,
-        f"RFE (Gradient Boosting) – Top {RFE_N_FEATURES} Features (Regression)",
-        "reg_rfe_gb.png",
     )
 
     # ------------------------------------------------------------------
