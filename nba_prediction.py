@@ -31,7 +31,6 @@ import pandas as pd
 import seaborn as sns
 
 from scipy.stats import uniform, randint
-
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.decomposition import PCA
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
@@ -68,6 +67,10 @@ LR_PARAMS = dict(max_iter=1000, random_state=42)
 RIDGE_PARAMS = dict(alpha=1.0)
 
 # Hyperparameter search space for Gradient Boosting (shared by clf and reg)
+# n_estimators: 100–500 covers light to heavy ensembles
+# max_depth: 2–6 prevents overfitting while allowing interaction effects
+# learning_rate: 0.01–0.2 ranges from very conservative to moderate
+# subsample: 0.6–1.0 (uniform(0.6, 0.4) → U[0.6, 1.0]) for stochastic boosting
 GB_SEARCH_SPACE = dict(
     n_estimators=randint(100, 501),
     max_depth=randint(2, 7),

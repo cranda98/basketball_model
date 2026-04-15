@@ -267,7 +267,9 @@ season_stage_away = team_game_ss[team_game_ss['role'] == 'away'][
     ['gameId', 'games_into_season', 'season_stage']
 ].rename(columns={'games_into_season': 'away_games_into_season', 'season_stage': 'away_season_stage'})
 
-print(f"  Season stage distribution: early={(_season_stage_bucket(0) == 0)}, mid, late")
+print(f"  Season stage distribution: early={(team_game_ss['season_stage'] == 0).sum()}, "
+      f"mid={(team_game_ss['season_stage'] == 1).sum()}, "
+      f"late={(team_game_ss['season_stage'] == 2).sum()}")
 
 # 8. ROLLING AVERAGES (multi-window sweep, no leakage)
 # shift(1) ensures we only use information from BEFORE the current game.
