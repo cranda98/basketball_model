@@ -20,9 +20,14 @@ Three tables are used:
 
 ## Pipeline
 
-1. `src/cleaning.py` — loads raw data, engineers features, outputs train/test CSVs
-2. `src/classification.py` — trains and evaluates classification models
-3. `src/regression.py` — trains and evaluates regression models
+1. `src/cleaning.py` — loads raw Kaggle CSVs from `src/data/`, engineers features, and writes `nba_train.csv`, `nba_test.csv`, and `nba_processed_full.csv` back to `src/data/`
+2. `nba_prediction.py` — trains and evaluates all models (Logistic Regression, Gradient Boosting for classification; Ridge Regression, Gradient Boosting for regression) and saves plots to `plots/`
+
+Run in order:
+```bash
+python src/cleaning.py
+python nba_prediction.py
+```
 
 ## Future Work
 

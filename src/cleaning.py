@@ -3,15 +3,21 @@ CSE 482 - Sports Analytics Project
 NBA Game Outcome Prediction - Data Preprocessing Pipeline
 """
 
+import os
+
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import RFE
 
+# Resolve paths relative to this script so it runs from any working directory
+_SRC_DIR  = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_SRC_DIR, 'data')
+
 # 1. LOAD RAW DATA
-games = pd.read_csv('data/cse482_project_db_Games.csv')
-stats = pd.read_csv('data/cse482_project_db_TeamStatistics.csv')
-adv   = pd.read_csv('data/cse482_project_db_TeamStatisticsAdvanced.csv')
+games = pd.read_csv(os.path.join(_DATA_DIR, 'cse482_project_db_Games.csv'))
+stats = pd.read_csv(os.path.join(_DATA_DIR, 'cse482_project_db_TeamStatistics.csv'))
+adv   = pd.read_csv(os.path.join(_DATA_DIR, 'cse482_project_db_TeamStatisticsAdvanced.csv'))
 
 for df in [games, stats, adv]:
     df['gameId'] = df['gameId'].astype(str)
@@ -390,9 +396,9 @@ train = train[keep_cols_ordered]
 test  = test[keep_cols_ordered]
 
 # 12. SAVE
-final.to_csv('data/nba_processed_full.csv', index=False)
-train.to_csv('data/nba_train.csv', index=False)
-test.to_csv('data/nba_test.csv', index=False)
+final.to_csv(os.path.join(_DATA_DIR, 'nba_processed_full.csv'), index=False)
+train.to_csv(os.path.join(_DATA_DIR, 'nba_train.csv'), index=False)
+test.to_csv(os.path.join(_DATA_DIR, 'nba_test.csv'), index=False)
 
 print("\nSaved: nba_processed_full.csv | nba_train.csv | nba_test.csv")
 
